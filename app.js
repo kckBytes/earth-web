@@ -3,7 +3,7 @@
 import { FW, FH, GW, GH, estimateFlow, stillFlow, flowStats } from './flow.js';
 
 const CLOUD_URL = 'https://clouds.matteason.co.uk/images/4096x2048/clouds.jpg';
-const CHECK_MS = 30 * 60 * 1000;
+const CHECK_MS = 10 * 60 * 1000;
 const MAX_ZOOM = 3.0, LAPSE_H = 12, LAPSE_S = 3.0;
 const rad = d => d * Math.PI / 180, deg = r => r * 180 / Math.PI;
 const wrapLon = l => ((l + 540) % 360) - 180;
@@ -143,7 +143,27 @@ function rememberMap(small, now) {
   return { time: now, prev, small };
 }
 
+const LIVE = 'https://kckbytes.github.io/earth-live/';
+/** Live source: 5 geostationary satellites stitched every 10 min (with motion measured on the server). */
+async function refreshLive(initial) {
+  const meta = await (await fetch(LIVE + 'meta.json?t=' + Date.now(), { cache: 'no-store' })).json();
+  if (!initial && meta.time === cloud.time) return true;
+  const [bmp, fl] = await Promise.all([loadBitmap(LIVE + 'clouds_4096.jpg?t=' + meta.time), loadBitmap(LIVE + 'flow.png?t=' + meta.time)]);
+  const c = document.createElement('canvas'); c.width = GW; c.height = GH;
+  const g = c.getContext('2d'); g.drawImage(fl, 0, 0);
+  const px = g.getImageData(0, 0, GW, GH).data, flowRG = new Uint8Array(GW * GH * 2);
+  for (let i = 0; i < GW * GH; i++) { flowRG[2 * i] = px[4 * i]; flowRG[2 * i + 1] = px[4 * i + 1]; }
+  if (!initial) { swapCloudSlots(); cloudPrev = cloud; cloudMixStart = performance.now(); }
+  uploadImage('uClouds', bmp, false); bmp.close?.(); fl.close?.();
+  uploadFlow('uFlow', flowRG);
+  cloud = { time: meta.time, flow: flowRG };
+  console.info(`live clouds observed ${Math.round((Date.now() - meta.time) / 60000)} min ago`);
+  kick();
+  return true;
+}
+
 async function refreshClouds(initial) {
+  try { if (await refreshLive(initial)) return; } catch (e) { console.warn('live clouds unavailable, using the 3-hour map', e); }
   let bmp;
   try { bmp = await loadBitmap(CLOUD_URL, { cache: initial ? 'default' : 'no-cache', mode: 'cors' }); }
   catch (e) { if (initial) bmp = await loadBitmap('tex/clouds.jpg'); else return; }

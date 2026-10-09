@@ -1,6 +1,6 @@
 // Offline shell: the app and its textures are cached on first visit. Clouds come live from the
 // network (cross-origin, not cached here); without a connection the app falls back to tex/clouds.jpg.
-const V = 'earth-v1';
+const V = 'earth-v2';
 const SHELL = ['./', 'index.html', 'app.js', 'flow.js', 'globe.vert', 'globe.frag', 'manifest.webmanifest',
   'tex/lights.jpg', 'tex/water.jpg', 'tex/clouds.jpg', 'icons/icon-180.png', 'icons/icon-192.png'];
 self.addEventListener('install', e => e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
