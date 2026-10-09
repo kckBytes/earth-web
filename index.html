@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Earth</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="description" content="Live Earth: real sunlight, city lights and moving satellite clouds.">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Earth">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="preload" href="globe.frag" as="fetch" crossorigin>
+<style>
+  :root {
+    --glass: rgba(255,255,255,0.15);
+    --glass-down: rgba(255,255,255,0.33);
+    --edge: rgba(255,255,255,0.33);
+    --ink: #fff;
+    --ink-dim: rgba(255,255,255,0.62);
+    --sheet: rgba(18,20,26,0.92);
+    color-scheme: dark;
+  }
+  [hidden] { display: none !important; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--ink); overflow: hidden;
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; overscroll-behavior: none; }
+  #globe { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; touch-action: none; }
+
+  /* bottom controls: [home] [-] (next / hold = joystick) [+] [hold = time-lapse] */
+  #controls { position: fixed; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 14px);
+    display: flex; align-items: center; justify-content: center; gap: 10px; pointer-events: none; }
+  .round { pointer-events: auto; width: 46px; height: 46px; border-radius: 50%; border: 1px solid var(--edge);
+    background: var(--glass); color: var(--ink); font-size: 20px; display: grid; place-items: center; padding: 0;
+    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); cursor: pointer; touch-action: none; }
+  .round:active, .round.down { background: var(--glass-down); }
+  .round svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  #stick { pointer-events: none; position: relative; width: 132px; height: 132px; border-radius: 50%; touch-action: none; }
+  #stick::before { content: ""; position: absolute; inset: 6px; border-radius: 50%; border: 1.2px solid transparent;
+    background: transparent; transition: border-color .2s, background .2s; }
+  #stick.stick::before { border-color: rgba(255,255,255,0.33); background: rgba(255,255,255,0.08); }
+  #stick .knob { position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px 0 0 -26px; border-radius: 50%;
+    background: rgba(255,255,255,0.2); border: 1.2px solid rgba(255,255,255,0.4); display: grid; place-items: center;
+    transition: transform .18s cubic-bezier(.2,.8,.2,1), background .15s; cursor: pointer; pointer-events: auto; touch-action: none; }
+  #stick.down .knob { background: var(--glass-down); }
+  #stick.stick .knob { transition: background .15s; }
+  #stick .knob svg { width: 18px; height: 18px; stroke: #fff; stroke-width: 2.4; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  #stick .knob .dot { display: none; width: 8px; height: 8px; border-radius: 50%; background: #fff; }
+  #stick.stick .knob svg { display: none; }
+  #stick.stick .knob .dot { display: block; }
+
+  #more { position: fixed; top: calc(env(safe-area-inset-top) + 12px); right: 14px; width: 38px; height: 38px; opacity: .55; }
+  #more:hover { opacity: .9; }
+
+  #label { position: fixed; left: 50%; top: 0; padding: 4px 12px; font-weight: 500; letter-spacing: .04em; font-size: 17px;
+    text-shadow: 0 0 8px rgba(0,0,0,.8); opacity: 0; transition: opacity .4s; pointer-events: none; white-space: nowrap; }
+  #label.on { opacity: 1; }
+
+  #hint { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 178px); transform: translateX(-50%);
+    font-size: 13px; color: var(--ink-dim); text-align: center; opacity: 0; transition: opacity .8s; pointer-events: none; width: 90%; }
+  #hint.on { opacity: 1; }
+
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--ink-dim); font-size: 14px;
+    letter-spacing: .08em; transition: opacity .6s; background: #000; }
+  #loading.gone { opacity: 0; pointer-events: none; }
+  #nogl { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; }
+
+  /* settings sheet */
+  #sheet { position: fixed; inset: 0; background: rgba(0,0,0,0.35); opacity: 0; pointer-events: none; transition: opacity .25s; }
+  #sheet.open { opacity: 1; pointer-events: auto; }
+  #sheet .panel { position: absolute; left: 0; right: 0; bottom: 0; max-height: 82vh; overflow-y: auto; margin: 0 auto; max-width: 520px;
+    background: var(--sheet); border-radius: 18px 18px 0 0; padding: 18px 18px calc(env(safe-area-inset-bottom) + 18px);
+    transform: translateY(24px); transition: transform .25s; -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+    -webkit-user-select: text; user-select: text; }
+  #sheet.open .panel { transform: none; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-dim); margin: 18px 0 8px; font-weight: 600; }
+  .panel h2:first-of-type { margin-top: 4px; }
+  .top { display: flex; justify-content: space-between; align-items: center; }
+  .top b { font-size: 18px; }
+  .x { background: none; border: 0; color: var(--ink-dim); font-size: 26px; line-height: 1; padding: 4px 8px; cursor: pointer; }
+  #cityList { list-style: none; margin: 0; padding: 0; }
+  #cityList li { display: flex; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.08); }
+  #cityList button { background: none; border: 0; color: var(--ink); padding: 11px 6px; font: inherit; cursor: pointer; }
+  #cityList .cname { flex: 1; text-align: left; }
+  #cityList .star { color: #ffd479; margin-right: 6px; }
+  #cityList .mk, #cityList .rm { color: var(--ink-dim); width: 40px; font-size: 18px; }
+  #cityList .mk:disabled { visibility: hidden; }
+  form { display: flex; gap: 8px; margin-top: 10px; }
+  input[type=text] { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.18);
+    background: rgba(255,255,255,0.06); color: var(--ink); font: inherit; font-size: 16px; }
+  .pill { padding: 10px 14px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.22); background: rgba(255,255,255,0.1);
+    color: var(--ink); font: inherit; cursor: pointer; }
+  .result { display: block; width: 100%; text-align: left; margin-top: 6px; }
+  #addResults { font-size: 14px; color: var(--ink-dim); }
+  #addResults .result { padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.05); color: var(--ink); font: inherit; cursor: pointer; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+  .row small { color: var(--ink-dim); display: block; }
+  .switch { position: relative; width: 48px; height: 28px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; border-radius: 14px; background: rgba(255,255,255,0.18); transition: background .2s; cursor: pointer; }
+  .switch span::after { content: ""; position: absolute; left: 3px; top: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .2s; }
+  .switch input:checked + span { background: #3a8bff; }
+  .switch input:checked + span::after { transform: translateX(20px); }
+  #installHint { margin-top: 14px; padding: 12px; border-radius: 12px; background: rgba(58,139,255,0.14); font-size: 14px; }
+  .help { font-size: 14px; color: var(--ink-dim); margin: 0; padding-left: 18px; }
+  .help li { margin: 3px 0; }
+  .credits { font-size: 12px; color: var(--ink-dim); margin-top: 14px; }
+  .credits a { color: var(--ink-dim); }
+</style>
+</head>
+<body>
+<canvas id="globe" aria-label="Live globe"></canvas>
+<div id="label" aria-live="polite"></div>
+<div id="hint">Double-tap to zoom · drag to turn · tap ● for the next city, hold it to fly</div>
+
+<button id="more" class="round" aria-label="Cities and settings">
+  <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg>
+</button>
+
+<div id="controls">
+  <button id="home" class="round" aria-label="Home city"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7"/><path d="M6 10v9h12v-9"/></svg></button>
+  <button id="zout" class="round" aria-label="Zoom out"><svg viewBox="0 0 24 24"><path d="M6 12h12"/></svg></button>
+  <div id="stick" role="button" aria-label="Next city; hold to fly">
+    <div class="knob"><svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg><span class="dot"></span></div>
+  </div>
+  <button id="zin" class="round" aria-label="Zoom in"><svg viewBox="0 0 24 24"><path d="M6 12h12M12 6v12"/></svg></button>
+  <button id="time" class="round" aria-label="Hold to fast-forward time"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg></button>
+</div>
+
+<div id="sheet" role="dialog" aria-label="Settings">
+  <div class="panel">
+    <div class="top"><b>Earth</b><button id="closeSheet" class="x" aria-label="Close">×</button></div>
+    <h2>Cities</h2>
+    <ul id="cityList"></ul>
+    <form id="addForm" autocomplete="off">
+      <input id="addInput" type="text" placeholder="Add a city" enterkeyhint="search">
+      <button class="pill" type="submit">Find</button>
+    </form>
+    <div id="addResults"></div>
+    <div class="row" style="margin-top:10px"><button id="myLoc" class="pill" type="button">Use my location</button><small id="locStatus"></small></div>
+
+    <h2>Motion</h2>
+    <label class="row"><span>Tilt parallax<small>Move the phone to look around a little</small></span>
+      <span class="switch"><input id="tiltToggle" type="checkbox"><span></span></span></label>
+
+    <h2>How to use</h2>
+    <ul class="help">
+      <li>Double-tap the globe to zoom in there; again at full zoom to come back out.</li>
+      <li>Drag to turn the Earth, pinch to zoom.</li>
+      <li>● tap: next city · hold and move: fly anywhere.</li>
+      <li>◷ hold: fast-forward time (watch day and night sweep and the clouds stream).</li>
+    </ul>
+    <div id="installHint" hidden>On iPhone: tap <b>Share</b> → <b>Add to Home Screen</b> to get Earth as an app, full screen.</div>
+    <p class="credits">Real sunlight, city lights and live satellite clouds (EUMETSAT via <a href="https://clouds.matteason.co.uk" target="_blank" rel="noopener">clouds.matteason.co.uk</a>), refreshed about every 3 hours and moved along the measured winds. Imagery: NASA Blue Marble and Black Marble. Places: Open-Meteo.</p>
+  </div>
+</div>
+
+<div id="loading">EARTH</div>
+<div id="nogl" hidden>This browser can't draw the globe (WebGL 2 is needed). Try Safari or Chrome.</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
