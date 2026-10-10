@@ -29,7 +29,29 @@
   html, body { margin: 0; height: 100%; background: #000; color: var(--ink); overflow: hidden;
     font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
     -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; overscroll-behavior: none; }
-  #globe { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; touch-action: none; }
+  #globe, #overlay { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; touch-action: none; }
+  #overlay { pointer-events: none; }
+
+  /* tabs: Wallpaper (the Android lock screen) / Explore (control mode) */
+  #tabs { position: fixed; top: calc(env(safe-area-inset-top) + 12px); left: 50%; transform: translateX(-50%); display: flex;
+    padding: 3px; border-radius: 20px; background: rgba(255,255,255,0.10); border: 1px solid rgba(255,255,255,0.16);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); z-index: 3; }
+  #tabs button { border: 0; background: none; color: var(--ink-dim); font: inherit; font-size: 13px; font-weight: 600; letter-spacing: .02em;
+    padding: 6px 14px; border-radius: 16px; cursor: pointer; }
+  #tabs button.on { background: rgba(255,255,255,0.18); color: var(--ink); }
+  body[data-tab=wall] #tabs { opacity: .55; transition: opacity .3s; }
+  body[data-tab=wall] #tabs:hover, body[data-tab=wall] #tabs:active { opacity: 1; }
+
+  /* the lock screen: clock and date like the Pixel's, nothing else */
+  #lock { position: fixed; left: 0; right: 0; top: calc(env(safe-area-inset-top) + 64px); text-align: center; pointer-events: none;
+    display: none; text-shadow: 0 0 18px rgba(0,0,0,.6); }
+  body[data-tab=wall] #lock { display: block; }
+  #lockTime { font-size: min(26vw, 120px); font-weight: 300; letter-spacing: -.02em; line-height: 1; font-variant-numeric: tabular-nums; }
+  #lockDate { font-size: 16px; color: rgba(255,255,255,.85); margin-top: 6px; }
+  #lockHint { position: fixed; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 18px); text-align: center; font-size: 12px;
+    color: rgba(255,255,255,.45); display: none; pointer-events: none; }
+  body[data-tab=wall] #lockHint { display: block; }
+  body[data-tab=wall] #controls { display: none; }
 
   /* bottom controls: [home] [-] (next / hold = joystick) [+] [hold = time-lapse] */
   #controls { position: fixed; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 14px);
@@ -110,11 +132,22 @@
   .help { font-size: 14px; color: var(--ink-dim); margin: 0; padding-left: 18px; }
   .help li { margin: 3px 0; }
   .credits { font-size: 12px; color: var(--ink-dim); margin-top: 14px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { border: 1px solid rgba(255,255,255,0.16); background: rgba(255,255,255,0.05); color: var(--ink); font: inherit; font-size: 14px;
+    padding: 7px 11px; border-radius: 10px; cursor: pointer; text-align: left; }
+  .chip small { display: block; font-size: 11px; color: var(--ink-dim); }
+  .chip.on { background: rgba(58,139,255,0.25); border-color: rgba(58,139,255,0.7); }
+  .chip.small { padding: 6px 10px; }
+  .subhead { width: 100%; font-size: 12px; color: var(--ink-dim); margin: 8px 0 2px; }
   .credits a { color: var(--ink-dim); }
 </style>
 </head>
 <body>
 <canvas id="globe" aria-label="Live globe"></canvas>
+<canvas id="overlay" aria-hidden="true"></canvas>
+<div id="tabs" role="tablist"><button data-tab="wall" role="tab">Wallpaper</button><button data-tab="explore" role="tab">Explore</button></div>
+<div id="lock" aria-hidden="true"><div id="lockTime"></div><div id="lockDate"></div></div>
+<div id="lockHint">tap = wake up · double-tap = zoom · triple-tap = replay the last hours</div>
 <div id="label" aria-live="polite"></div>
 <div id="hint">Double-tap to zoom · drag to turn · tap ● for the next city, hold it to fly</div>
 
@@ -144,6 +177,20 @@
     <div id="addResults"></div>
     <div class="row" style="margin-top:10px"><button id="myLoc" class="pill" type="button">Use my location</button><small id="locStatus"></small></div>
 
+    <h2>Globe view</h2>
+    <div id="views" class="chips"></div>
+
+    <h2>Replay</h2>
+    <div class="row"><span>Triple-tap replays the real satellite record of the last</span></div>
+    <div id="replayH" class="chips"></div>
+    <div class="row" style="margin-top:8px"><button id="replayNow" class="pill" type="button">Play it now</button></div>
+
+    <h2>On the globe</h2>
+    <label class="row"><span>Globe labels<small>Storms, highs/lows, eruptions, quakes, fires, lightning, launches, space stations</small></span>
+      <span class="switch"><input id="labelsToggle" type="checkbox"><span></span></span></label>
+    <label class="row"><span>Wind streaks<small>On the weather views</small></span>
+      <span class="switch"><input id="streaksToggle" type="checkbox"><span></span></span></label>
+
     <h2>Motion</h2>
     <label class="row"><span>Tilt parallax<small>Move the phone to look around a little</small></span>
       <span class="switch"><input id="tiltToggle" type="checkbox"><span></span></span></label>
@@ -154,9 +201,12 @@
       <li>Drag to turn the Earth, pinch to zoom.</li>
       <li>● tap: next city · hold and move: fly anywhere.</li>
       <li>◷ hold: fast-forward time (watch day and night sweep and the clouds stream).</li>
+      <li><b>Wallpaper</b> tab: exactly what the Android lock screen shows. Tap = wake up (the real last 6 hours play),
+        double-tap = zoom, triple-tap = replay the hours you chose.</li>
     </ul>
     <div id="installHint" hidden>On iPhone: tap <b>Share</b> → <b>Add to Home Screen</b> to get Earth as an app, full screen.</div>
-    <p class="credits">Real sunlight, city lights and live clouds from five weather satellites (GOES-East/West, Himawari, Meteosat), stitched every 10 minutes (<a href="https://kckbytes.github.io/earth-live/" target="_blank" rel="noopener">earth-live</a>) and moved along the measured winds. Contains modified EUMETSAT data. Imagery: NASA Blue Marble and Black Marble. Places: Open-Meteo.</p>
+    <p class="credits">Real sunlight, city lights and live clouds from five weather satellites (GOES-East/West, Himawari, Meteosat), stitched every 10 minutes (<a href="https://kckbytes.github.io/earth-live/" target="_blank" rel="noopener">earth-live</a>) and moved along the measured winds. Weather layers: NOAA GFS and WAVEWATCH III. Labels: GDACS, NOAA NHC, Launch Library 2, CelesTrak.
+      Aurora: NOAA SWPC. Fires: NASA FIRMS. Lightning: NOAA GOES GLM. Contains modified EUMETSAT data. Imagery: NASA Blue Marble and Black Marble. Places: Open-Meteo.</p>
   </div>
 </div>
 
