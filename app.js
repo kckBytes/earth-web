@@ -802,10 +802,21 @@ const btn = (id, f) => document.getElementById(id).addEventListener('click', f);
 btn('home', () => { cityIdx = 0; flyTo(cities[0], 1); });
 btn('zin', () => zoomStep(+1));
 btn('zout', () => zoomStep(-1));
-(() => {   // hold = fast-forward time (2 h per second); release eases back to now
+(() => {   // tap = replay the real past hours (stored satellite frames); hold = fast-forward time (2 h per second)
   const el = document.getElementById('time');
-  el.addEventListener('pointerdown', e => { e.preventDefault(); el.setPointerCapture(e.pointerId); el.classList.add('down'); warp = true; kick(); });
-  const end = () => { el.classList.remove('down'); warp = false; };
+  let holdTimer = 0;
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault(); el.setPointerCapture(e.pointerId); el.classList.add('down');
+    holdTimer = setTimeout(() => { holdTimer = 0; warp = true; kick(); }, 280);
+  });
+  const end = () => {
+    el.classList.remove('down');
+    if (holdTimer) {                       // a tap: the real replay, same as triple-tap on the Wallpaper tab
+      clearTimeout(holdTimer); holdTimer = 0;
+      playReplay(cfg.replayH, 2.2 + cfg.replayH * 0.33, null, `Last ${cfg.replayH} h`) || (lapseT0 = performance.now(), kick());
+    }
+    warp = false;
+  };
   el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
   el.addEventListener('contextmenu', e => e.preventDefault());
 })();
