@@ -233,6 +233,9 @@ async function pruneCache(keep) {
 }
 const frameUrl = (t, kind) => { const f = frameList.find(x => x.t === t); return `${LIVE}frames/${t}_${kind === 'bt' ? 'bt.jpg' : 'c.jpg'}?v=${f ? f.v || 0 : 0}`; };
 const flowUrl = t => `${LIVE}frames/${t}_f.png?v=${(frameList.find(x => x.t === t) || {}).v || 0}`;
+// fine motion to the next picture (512 x 256), when the server made one: in-between frames of the replay
+const fineUrl = t => { const f = frameList.find(x => x.t === t); return f && f.d ? `${LIVE}frames/${t}_d.png?v=${f.d}` : null; };
+const DW = 512, DH = 256;
 
 let labels = [], sky = { fires: [], lightning: [] }, haveAurora = false, wxMeta = null;
 let sideAt = 0;
@@ -246,7 +249,7 @@ async function syncSide(force) {
     frameAct = new Map(frameList.filter(f => f.a).map(f => [f.t, f.a]));
     const keep = new Set();
     const k = kindOf(cfg.view);
-    for (const f of frameList.slice(-Math.max(WAKE_H, cfg.replayH) * 2 - 1)) { keep.add(frameUrl(f.t, k)); keep.add(flowUrl(f.t)); }
+    for (const f of frameList.slice(-49)) { keep.add(frameUrl(f.t, k)); keep.add(flowUrl(f.t)); const u = fineUrl(f.t); if (u) keep.add(u); }
     if (wxMeta) for (const t of wxMeta.times) for (const sh of 'abcw') keep.add(`${LIVE}wx/${t}_${sh}.png`);
     pruneCache(keep);
     prefetchWake();
@@ -273,10 +276,15 @@ function replayTimes(hours) {
   return ts.filter(t => t >= newest - hours * 3600e3 - 60e3);
 }
 async function decodeFrame(t, kind) {
-  const [img, fl] = await Promise.all([cached(frameUrl(t, kind)).then(b => createImageBitmap(b)), cached(flowUrl(t)).then(b => createImageBitmap(b))]);
-  const c = new OffscreenCanvas(GW, GH), g = c.getContext('2d'); g.drawImage(fl, 0, 0);
-  const px = g.getImageData(0, 0, GW, GH).data, rg = new Uint8Array(GW * GH * 2);
-  for (let i = 0; i < GW * GH; i++) { rg[2 * i] = px[4 * i]; rg[2 * i + 1] = px[4 * i + 1]; }
+  const fu = fineUrl(t);
+  const fineBmp = fu ? cached(fu).then(b => createImageBitmap(b, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' })).catch(() => null) : Promise.resolve(null);
+  const [img, fine, fl] = await Promise.all([cached(frameUrl(t, kind)).then(b => createImageBitmap(b)), fineBmp,
+    cached(flowUrl(t)).then(b => createImageBitmap(b))]);
+  const src = fine && fine.width === DW && fine.height === DH ? fine : fl, w = src === fine ? DW : GW, h = src === fine ? DH : GH;
+  const c = new OffscreenCanvas(w, h), g = c.getContext('2d'); g.drawImage(src, 0, 0);
+  const px = g.getImageData(0, 0, w, h).data, rg = new Uint8Array(w * h * 2);
+  for (let i = 0; i < w * h; i++) { rg[2 * i] = px[4 * i]; rg[2 * i + 1] = px[4 * i + 1]; }
+  rg.w = w; rg.h = h; rg.fine = src === fine;
   return { img, flow: rg };
 }
 let wakePrep = null;
@@ -299,7 +307,7 @@ function texR8(t, img) {
 }
 function texRG(t, rg) {
   gl.activeTexture(gl.TEXTURE15); gl.bindTexture(gl.TEXTURE_2D, t); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, GW, GH, 0, gl.RG, gl.UNSIGNED_BYTE, rg);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, rg.w || GW, rg.h || GH, 0, gl.RG, gl.UNSIGNED_BYTE, rg);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 }
@@ -320,9 +328,11 @@ function stepWeights(ts) {
 }
 let replay = null, tail = null;
 class Replay {
-  constructor(ts, kind, durS, pre) {
+  constructor(ts, kind, durS, pre, timed) {
     this.t = ts; this.kind = kind; this.a = -1; this.pos = 0; this.loaded = new Map(); this.cancelled = false;
-    const w = stepWeights(ts), sum = w.reduce((x, y) => x + y, 0);
+    // timed (a replay you started): literal playback, each step as long as the real time between the pictures
+    const w = timed ? ts.slice(1).map((t, i) => Math.max(1, (t - ts[i]) / 1800e3)) : stepWeights(ts), sum = w.reduce((x, y) => x + y, 0);
+    this.timed = !!timed; this.endHold = 0;
     this.stepS = w.map(x => Math.max(0.09, durS * x / sum));
     this.ra = 0; this.rb = 1; this.rc = 2; this.prep = -1; this.start = performance.now(); this.last = 0;
     if (pre) { this.loaded.set(0, pre.f0); this.loaded.set(1, pre.f1); }
@@ -343,8 +353,14 @@ class Replay {
     }
     if (this.prep !== this.a + 2 && this.loaded.has(this.a + 2)) { texR8(rtex[this.rc], this.loaded.get(this.a + 2).img); this.prep = this.a + 2; }
     const dt = Math.min((now - this.last) / 1000, 0.05); this.last = now;
+    if (replayPaused) return true;                          // frozen on this moment
     this.pos += dt / this.stepS[clamp(Math.floor(this.pos), 0, this.stepS.length - 1)];
-    if (this.pos >= this.t.length - 1) return false;
+    if (this.pos >= this.t.length - 1) {
+      if (!this.timed) return false;
+      if (!this.endHold) this.endHold = now;                   // stay on the last real picture a moment
+      this.pos = this.t.length - 1 - 1e-6;
+      return now - this.endHold < 2000 || replayPaused;
+    }
     if (this.pos >= this.a + 1) {
       if (this.prep !== this.a + 2) { this.pos = this.a + 0.999; return true; }   // next frame not in yet: hold
       [this.ra, this.rb, this.rc] = [this.rb, this.rc, this.ra];
@@ -354,20 +370,71 @@ class Replay {
     }
     return true;
   }
-  mix() { return clamp(this.pos - this.a, 0, 1); }
-  hours() { return this.a >= 0 && this.a + 1 < this.t.length ? (this.t[this.a + 1] - this.t[this.a]) / 3600e3 : 0.5; }
-  timeMs() { return this.a < 0 ? this.t[0] : this.a + 1 < this.t.length ? this.t[this.a] + this.mix() * (this.t[this.a + 1] - this.t[this.a]) : this.t[this.t.length - 1]; }
+  moving() {                                               // in-between frames along the fine motion, where there is one
+    if (!this.timed) return true;
+    const f = this.a >= 0 && this.loaded.get(this.a);
+    return cfg.smooth !== false && !!(f && f.flow.fine);
+  }
+  mix() {
+    const m = clamp(this.pos - this.a, 0, 1);
+    if (this.moving()) return m;
+    const k = clamp((m - 0.72) / 0.28, 0, 1); return k * k * (3 - 2 * k);   // hold the real picture, quick crossfade
+  }
+  hours() { return !this.moving() ? 0 : this.a >= 0 && this.a + 1 < this.t.length ? (this.t[this.a + 1] - this.t[this.a]) / 3600e3 : 0.5; }
+  timeMs() { const m = clamp(this.pos - this.a, 0, 1); return this.a < 0 ? this.t[0] : this.a + 1 < this.t.length ? this.t[this.a] + m * (this.t[this.a + 1] - this.t[this.a]) : this.t[this.t.length - 1]; }
 }
-function playReplay(hours, durS, pre, label) {
+let replayPaused = false, fetchingFrames = false, sunBackMs = 0;
+function playReplay(hours, durS, pre, label, timed) {
   const k = kindOf(cfg.view);
   if (k === 'sst') return false;
   const ts = pre ? pre.ts : replayTimes(hours);
   if (ts.length < 2) return false;
   if (replay) replay.cancelled = true;
   tail = null;
-  replay = new Replay(ts, k, durS, pre);
+  replay = new Replay(ts, k, durS, pre, timed);
+  replay.timed = !!timed; replay.lIdx = -2; replayPaused = false;
   if (label) showLabel(label);
   kick(); return true;
+}
+/** Explore's clock button / triple-tap: the real last hours, fetching the frame list first if it isn't here yet. */
+async function userReplay(hours) {
+  hours = hours || cfg.replayH;
+  if (replay && replay.timed) { replayPaused = !replayPaused; replay.lIdx = -2; syncTimeBtn(); kick(); return; }
+  if (fetchingFrames) return;
+  if (kindOf(cfg.view) !== 'sst' && replayTimes(hours).length < 2) {
+    fetchingFrames = true; syncTimeBtn(); showLabel('Getting the real frames\u2026');
+    try { await syncSide(true); } catch { /* offline */ }
+    fetchingFrames = false;
+  }
+  if (!playReplay(hours, Math.max(8, hours * 0.8), null, null, true))   // ~1 s per hour, slow enough to follow
+    { lapseT0 = performance.now(); kick(); }
+  syncTimeBtn();
+}
+/** While replaying: "3:30 PM · 9 h ago", kept up until the replay ends. */
+function replayLabel(now) {
+  if (!replay || !replay.timed || replay.a < 0) return;
+  const idx = Math.min(replay.a + (replay.mix() >= 0.5 ? 1 : 0), replay.t.length - 1);
+  if (idx !== replay.lIdx) {
+    replay.lIdx = idx;
+    const t = replay.t[idx], ago = Math.max(0, (Date.now() - t) / 60e3);   // real age of this picture
+    const when = new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    showLabel((replayPaused ? '\u23F8\uFE0E  ' : '') + when + '  \u00B7  ' + (ago < 30 ? 'now' : ago < 90 ? '1 h ago' : Math.round(ago / 60) + ' h ago'));
+  }
+  labelUntil = now + 2800;
+}
+const TIME_ICONS = {
+  clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path d="M9 7v10M15 7v10"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M9 7l8 5-8 5z"/></svg>',
+  wait: '<svg viewBox="0 0 24 24"><path d="M7 12h.01M12 12h.01M17 12h.01"/></svg>' };
+let timeIcon = 'clock';
+function syncTimeBtn() {
+  const want = fetchingFrames ? 'wait' : !(replay && replay.timed) ? 'clock' : replayPaused ? 'play' : 'pause';
+  if (want === timeIcon) return;
+  timeIcon = want;
+  const el = document.getElementById('time');
+  el.innerHTML = TIME_ICONS[want];
+  el.setAttribute('aria-label', want === 'clock' ? 'Tap to replay the last hours, hold to fast-forward time' : want === 'pause' ? 'Pause' : want === 'play' ? 'Play' : 'Getting frames');
 }
 
 // ------------------------------------------------------------------ weather views (WxStore / GlobeThread.applyWx)
@@ -471,7 +538,7 @@ function drawOverlaysGL(T, view, cx, cy, r, fade, streakOn) {
       xyz(b[1], b[2], boltBuf, nb * 4); boltBuf[nb * 4 + 3] = Math.random() < Math.min(0.5, 0.04 + b[3] / 60) ? 1 : 0.1; nb++; }
     gl.blendFunc(gl.ONE, gl.ONE); gl.uniform1i(sU.uRound, 1); gl.uniform1f(sU.uAlpha, fade);
     gl.bindBuffer(gl.ARRAY_BUFFER, dVbo);
-    const ps = Math.max(4, r / 120);
+    const ps = Math.max(cv.width / 180, r / 120);          // never smaller than ~2 px-per-dp dot, even on the whole globe
     if (nf) { gl.bufferSubData(gl.ARRAY_BUFFER, 0, fireBuf.subarray(0, nf * 4)); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
       gl.uniform3f(sU.uColor, 1, 0.45, 0.12); gl.uniform1f(sU.uPointSize, ps); gl.drawArrays(gl.POINTS, 0, nf); }
     if (nb) { gl.bufferSubData(gl.ARRAY_BUFFER, 0, boltBuf.subarray(0, nb * 4)); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
@@ -603,20 +670,27 @@ function loop(now) {
   stepCamera(now);
   if (warp) warpOffsetMs += dt * 7200e3;
   else if (warpOffsetMs > 0) warpOffsetMs = warpOffsetMs < 60e3 ? 0 : warpOffsetMs * Math.exp(-6 * dt);
+  // a replay you start turns the sun back with it (day/night, city lights), then lets it run forward to now
+  if (replay && replay.timed) {
+    const target = Date.now() - (replay.a >= 0 ? replay.timeMs() : replay.t[0]);
+    sunBackMs = replay.a >= 0 ? target : sunBackMs + (target - sunBackMs) * (1 - Math.exp(-8 * dt));
+  } else if (sunBackMs > 0) sunBackMs = sunBackMs < 60e3 ? 0 : sunBackMs * Math.exp(-3 * dt);
   par.x += (tilt.x - par.x) * (1 - Math.exp(-9 * dt)); par.y += (tilt.y - par.y) * (1 - Math.exp(-9 * dt));
   if (readyT0) readyFade = Math.min(1, (now - readyT0) / 600);
   const cloudMix = cloudMixStart ? Math.min(1, (now - cloudMixStart) / 3000) : 1;
   if (cloudMix >= 1) cloudMixStart = 0;
   if (replay && !replay.step(now)) {
     if (replay.a >= 0) tail = { t0: now, t: replay.t[replay.t.length - 1], tex: rtex[replay.rb] };
-    replay.cancelled = true; replay = null;
+    replay.cancelled = true; replay = null; replayPaused = false;
   }
+  replayLabel(now);
+  syncTimeBtn();
   if (tail && now - tail.t0 > TAIL_S * 1000) tail = null;
   const wake = wakeT0 ? Math.min(1, (now - wakeT0) / 1000) : 1;
   const tilting = Math.abs(par.x - tilt.x) > 1.2e-3 || Math.abs(par.y - tilt.y) > 1.2e-3;
   const streaming = cfg.view >= 10 && cfg.streaks && wx.times.length;
-  const animating = tw || stick.x || stick.y || warp || warpOffsetMs > 0 || lapseT0 || wake < 1 || readyFade < 1 || cloudMix < 1 || labelUntil > now || dragging
-    || replay || tail || sleepT0 || streaming;
+  const animating = tw || stick.x || stick.y || warp || warpOffsetMs > 0 || (sunBackMs > 0 && !replay) || lapseT0 || wake < 1 || readyFade < 1 || cloudMix < 1 || (labelUntil > now && !replayPaused) || dragging
+    || (replay && !replayPaused) || tail || sleepT0 || streaming;
   const minGap = animating ? (streaming && !replay && !tw ? 30 : 0) : tilting ? 15 : 45;   // streaks alone: 30 fps
   if (now - lastDraw >= minGap - 2) { draw(now, cloudMix, wake); lastDraw = now; }
   updateLabel(now);
@@ -640,7 +714,7 @@ function draw(now, cloudMix, wake) {
   const lat = clamp(cam.lat - par.y * 45 / pz, -80, 80), lon = cam.lon + par.x * 45 / pz;
   const view = viewToEcef(lat, lon);
   Object.assign(frame, { cx, cy, r, view });
-  const nowMs = Date.now() + debugOffsetMs + warpOffsetMs, s = sun(nowMs);
+  const nowMs = Date.now() + debugOffsetMs + warpOffsetMs, s = sun(nowMs - sunBackMs);
   const cloudNow = nowMs - debugOffsetMs + lapseOffsetMs(now);
   const hrs = t => t > 0 ? clamp((cloudNow - t) / 3600e3, -12, 6) : 0;
   const playing = replay && replay.a >= 0;
@@ -714,8 +788,8 @@ function showLabel(text) {
 }
 function updateLabel(now) {
   if (labelUntil && now > labelUntil) { labelEl.classList.remove('on'); labelUntil = 0; }
-  const y = Math.min(labelAnchorY + 18, cv.clientHeight - 210);
-  labelEl.style.transform = `translate(-50%, ${Math.max(y, 60)}px)`;
+  const y = replay && replay.timed ? 56 : Math.max(Math.min(labelAnchorY + 18, cv.clientHeight - 210), 60);   // replay clock: at the top
+  labelEl.style.transform = `translate(-50%, ${y}px)`;
 }
 
 // ------------------------------------------------------------------ gestures on the globe
@@ -751,7 +825,7 @@ let dragging = false;
         lastTap = { t: now, x: p.x, y: p.y };
         clearTimeout(tapTimer);
         tapTimer = setTimeout(() => {
-          if (taps >= 3) playReplay(cfg.replayH, 2.2 + cfg.replayH * 0.33, null, `Last ${cfg.replayH} h`) || (lapseT0 = performance.now(), kick());
+          if (taps >= 3) userReplay();
           else if (taps === 2) { if (cfg.tab === 'wall') tweenTo(cam.lat, cam.lon, cam.zoom > 1.2 ? 1 : 1.9, 700); else zoomAt(p.x, p.y); }
           else if (cfg.tab === 'wall') powerCycle();
           taps = 0;
@@ -802,18 +876,18 @@ const btn = (id, f) => document.getElementById(id).addEventListener('click', f);
 btn('home', () => { cityIdx = 0; flyTo(cities[0], 1); });
 btn('zin', () => zoomStep(+1));
 btn('zout', () => zoomStep(-1));
-(() => {   // tap = replay the real past hours (stored satellite frames); hold = fast-forward time (2 h per second)
+(() => {   // tap = replay the real past hours (while it plays: pause / play); hold = fast-forward time (2 h per second)
   const el = document.getElementById('time');
   let holdTimer = 0;
   el.addEventListener('pointerdown', e => {
     e.preventDefault(); el.setPointerCapture(e.pointerId); el.classList.add('down');
-    holdTimer = setTimeout(() => { holdTimer = 0; warp = true; kick(); }, 280);
+    holdTimer = setTimeout(() => { holdTimer = 0; if (!(replay && replay.timed) && !fetchingFrames) { warp = true; kick(); } }, 280);
   });
   const end = () => {
     el.classList.remove('down');
     if (holdTimer) {                       // a tap: the real replay, same as triple-tap on the Wallpaper tab
       clearTimeout(holdTimer); holdTimer = 0;
-      playReplay(cfg.replayH, 2.2 + cfg.replayH * 0.33, null, `Last ${cfg.replayH} h`) || (lapseT0 = performance.now(), kick());
+      userReplay(24);                       // Explore: the whole last day
     }
     warp = false;
   };
